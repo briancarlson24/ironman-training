@@ -1,0 +1,6 @@
+# Personal tracking data (health info, changes daily) - not code
+training_log.json
+
+# Old versions - Git history replaces these
+*.bak
+*_old.pyw
