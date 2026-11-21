@@ -27,10 +27,12 @@ RUN
 
 FILES
     training_tracker.pyw   this script
-    training_log.json      your ticks, {"date|session": time ticked}, and
-                           your notes, {"date": text}.
+    training_log.json      your ticks, as a list of check records (see v19
+                           and v20), and your notes, {"date": text}.
                            Created on the first tick. A damaged file is
                            renamed to training_log.damaged.json, not deleted.
+    training_log.v1.json   copies of older-format logs, made once each when
+    training_log.v2.json   they are converted to the current format.
     C:\\Users\\brian\\.claude\\profile\\fitness-training.md   the schedule
 
 CHANGE LOG (all 2026-11-21)
@@ -125,14 +127,41 @@ CHANGE LOG (all 2026-11-21)
         session's details in the same tooltip at the mouse; clicking still
         opens the bigger popup. One shared hoverable() helper now drives
         both the note and session tooltips.
+    v19 Check history (2026-11-21). The log keeps a record of every check
+        instead of only the current state. Each record has:
+            id            a random unique ID (uuid4)
+            task          'date|session', e.g. '2026-11-21|meds'
+            user          the Windows login name of whoever clicked
+            checked_at    when the box was ticked (local time, to the second)
+            unchecked_at  when it was unticked; null while still ticked
+        Ticking adds a new record; unticking fills in unchecked_at on the
+        open one; ticking again adds another new record. A box shows as
+        ticked when its task has an open record (like an SCD2 table's
+        current row, where end_date IS NULL).
+        - Logs in the old format ("done": {task: time}) are converted on
+          load: each tick becomes an open record with its original time and
+          the current user. The old file is first copied to
+          training_log.v1.json.
+    v20 Check records are easier to report on (log file version 3).
+        - 'task' ('2026-11-21|meds') is split into two fields: planned_date
+          (the day the activity was planned for, i.e. the grid column) and
+          item (the habit or session key). No more splitting a combined key.
+        - Fields are saved in a fixed order instead of alphabetically:
+              id, planned_date, item, user, checked_at, unchecked_at
+        - Version 2 logs (with 'task') are converted on load; the old file
+          is first copied to training_log.v2.json.
+        - Fix: a converted log is saved as soon as the app opens. Before,
+          the conversion stayed in memory until the next tick or note.
 """
 
+import getpass
 import json
 import os
 import re
 import shutil
 import subprocess
 import tkinter as tk
+import uuid
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -140,6 +169,9 @@ from typing import NamedTuple
 
 HERE = Path(__file__).parent
 LOG_FILE = HERE / "training_log.json"
+LOG_VERSION = 3
+# Field order for each check record, as written to the file.
+CHECK_FIELDS = ("id", "planned_date", "item", "user", "checked_at", "unchecked_at")
 SCHEDULE_FILE = Path.home() / ".claude" / "profile" / "fitness-training.md"
 CYCLE_DAYS = 14
 
@@ -412,30 +444,94 @@ def task_id(d, key):
 
 
 # --- Saving and loading ticks ------------------------------------------------
+def now():
+    """Local time to the second, e.g. '2026-11-21T13:11:05'."""
+    return datetime.now().isoformat(timespec="seconds")
+
+
+def current_user():
+    """The Windows login name, e.g. 'brian'."""
+    try:
+        return getpass.getuser()
+    except Exception:  # no login name in the environment (rare)
+        return "unknown"
+
+
+def new_check(tid, checked_at=None, user=None, check_id=None, unchecked_at=None):
+    """One check record, with its fields in CHECK_FIELDS order. By default:
+    a new ID, the current user, ticked now, not yet unticked."""
+    planned_date, item = tid.split("|", 1)
+    return {"id": check_id or str(uuid.uuid4()),
+            "planned_date": planned_date,
+            "item": item,
+            "user": user or current_user(),
+            "checked_at": checked_at or now(),
+            "unchecked_at": unchecked_at}
+
+
+def check_task(c):
+    """A record's task ID ('2026-11-21|meds'), used to match it to a grid cell."""
+    return f"{c['planned_date']}|{c['item']}"
+
+
+def backup_file(version):
+    """Where an older-format log is copied before conversion, e.g. training_log.v1.json."""
+    return LOG_FILE.with_name(f"training_log.v{version}.json")
+
+
 def load_log():
-    """Return ({task_id: time ticked}, {date: note text}, warning).
-    Missing file = nothing done yet. Older logs without notes are fine."""
+    """Return ([check records], {date: note text}, warning).
+    Missing file = nothing done yet. Older logs without notes are fine.
+    Older formats are converted to check records, after copying the file:
+        v1  "done": {task: time ticked}
+        v2  "checks" with a combined 'task' field"""
     if not LOG_FILE.exists():
-        return {}, {}, ""
+        return [], {}, ""
     try:
         data = json.loads(LOG_FILE.read_text(encoding="utf-8"))
-        done, notes = data["done"], data.get("notes", {})
-        if not (isinstance(done, dict) and isinstance(notes, dict)):
+        notes = data.get("notes", {})
+        if "checks" not in data:
+            # v1: make each tick a record. Like an INSERT ... SELECT from the
+            # old table into the new one.
+            done = data["done"]
+            if not isinstance(done, dict):
+                raise TypeError
+            old_version = 1
+            checks = [new_check(tid, ticked) for tid, ticked in sorted(done.items())]
+        else:
+            rows = data["checks"]
+            if not (isinstance(rows, list) and all(isinstance(c, dict) for c in rows)):
+                raise TypeError
+            old_version = 2 if any("task" in c for c in rows) else None
+            # Rebuild every record so its fields are in CHECK_FIELDS order.
+            # v2 rows have 'task'; v3 rows already have planned_date and item.
+            checks = [new_check(c["task"] if "task" in c else check_task(c),
+                                checked_at=c["checked_at"], user=c.get("user"),
+                                check_id=c.get("id"), unchecked_at=c["unchecked_at"])
+                      for c in rows]
+        if not isinstance(notes, dict):
             raise TypeError
-        return done, notes, ""
-    except (ValueError, KeyError, TypeError):
+        if old_version:
+            if not backup_file(old_version).exists():
+                shutil.copy2(LOG_FILE, backup_file(old_version))  # once per old version
+            # Write the converted log now, so the file is in the current
+            # format as soon as the app opens (not only after the next tick).
+            save_log(checks, notes)
+        return checks, notes, ""
+    except (ValueError, KeyError, TypeError, AttributeError):
         # Don't silently lose a damaged file: set it aside and start fresh.
         backup = LOG_FILE.with_suffix(".damaged.json")
         LOG_FILE.replace(backup)
-        return {}, {}, f"Log file was unreadable; moved to {backup.name}."
+        return [], {}, f"Log file was unreadable; moved to {backup.name}."
 
 
-def save_log(done, notes):
+def save_log(checks, notes):
     """Write to a temp file first, then swap it in, so a crash mid-save
-    can't leave a half-written log behind."""
+    can't leave a half-written log behind. Keys are written in the order
+    they were built (CHECK_FIELDS for records), not alphabetically."""
     tmp = LOG_FILE.with_suffix(".tmp")
-    data = {"version": 1, "done": done, "notes": notes}
-    tmp.write_text(json.dumps(data, indent=2, sort_keys=True), encoding="utf-8")
+    data = {"version": LOG_VERSION, "checks": checks, "notes": dict(sorted(notes.items()))}
+    tmp.write_text(json.dumps(data, indent=2), encoding="utf-8")
     tmp.replace(LOG_FILE)
 
 
@@ -443,7 +539,10 @@ def save_log(done, notes):
 class TrainingTracker:
     def __init__(self, root):
         self.root = root
-        self.done, self.notes, warning = load_log()
+        self.checks, self.notes, warning = load_log()
+        # Tasks ticked right now: those with an open record (unchecked_at is
+        # null). Kept as a set so the grid and counts can look them up fast.
+        self.ticked = {check_task(c) for c in self.checks if c["unchecked_at"] is None}
         self.sched = None
         self.popup = None  # the details window, while one is open
         self.tip = None    # the hover tooltip for a note, while one is showing
@@ -617,7 +716,7 @@ class TrainingTracker:
         cells: a checkbox plus short text ('30m') that shows the session's
         details on hover and opens them in a popup on click."""
         tid = task_id(d, key)
-        var = tk.BooleanVar(value=tid in self.done)
+        var = tk.BooleanVar(value=tid in self.ticked)
         cell = self.put(tk.Frame(self.table), row, col)
         box = tk.Checkbutton(cell, variable=var, selectcolor=BG,
                              highlightthickness=0, bd=0, fg=GOOD)
@@ -662,17 +761,27 @@ class TrainingTracker:
 
     # --- Ticks and counts --------------------------------------------------------
     def toggle(self, d, tid, is_done):
+        """Ticking adds a new check record. Unticking closes the open one by
+        filling in unchecked_at; the record itself is kept as history."""
         if is_done:
-            self.done[tid] = datetime.now().isoformat(timespec="minutes")
+            if tid not in self.ticked:
+                self.checks.append(new_check(tid))
+                self.ticked.add(tid)
         else:
-            self.done.pop(tid, None)
+            stamp = now()
+            # Close every open record for this task. Normally there's only
+            # one, but this also tidies up a hand-edited file with two.
+            for c in self.checks:
+                if check_task(c) == tid and c["unchecked_at"] is None:
+                    c["unchecked_at"] = stamp
+            self.ticked.discard(tid)
         self.save()
         self.update_count(d)
         self.update_summary()
 
     def save(self):
         try:
-            save_log(self.done, self.notes)
+            save_log(self.checks, self.notes)
         except OSError as err:
             self.set_status(f"Could not save: {err}", warn=True)
 
@@ -687,7 +796,7 @@ class TrainingTracker:
 
     def count(self, ids):
         """(how many are ticked, how many there are), like SUM(done), COUNT(*)."""
-        return sum(tid in self.done for tid in ids), len(ids)
+        return sum(tid in self.ticked for tid in ids), len(ids)
 
     def update_count(self, d):
         n, total = self.count(self.ids(d))
@@ -723,7 +832,7 @@ class TrainingTracker:
         day = self.days[d]
         lines = [f"Where: {day.location}"] if day.location else []
         lines += [f"Note: {n}" for n in day.notes] + [""]
-        mark = lambda key: "[x]" if task_id(d, key) in self.done else "[ ]"
+        mark = lambda key: "[x]" if task_id(d, key) in self.ticked else "[ ]"
         lines += [f"{mark(key)} {slot}  {label}" for key, (slot, label) in day.tasks.items()]
         lines += [f"{mark(key)}     {name}" for key, name, _ in self.sched.habits]
         if d.isoformat() in self.notes:
