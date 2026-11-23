@@ -152,6 +152,19 @@ CHANGE LOG (all 2026-11-21)
           is first copied to training_log.v2.json.
         - Fix: a converted log is saved as soon as the app opens. Before,
           the conversion stayed in memory until the next tick or note.
+    v21 'Midnight oil' row below Notes, after a short gap (like the gap
+        between the habits and the sessions). One checkbox per day, saved
+        in the log as item 'midnight_oil'. It's not counted in Done or the
+        summary. The v20 version is saved as training_tracker.v20.bak.
+        - Schedule-file change: a 'Tech Training' habit row after Nutrition.
+    v22 Combined rows: several sessions can share one grid row, set by a new
+        optional 'Combined rows' setting, e.g.
+            Bike: bike, long_bike; Run/walk: run, long_run
+        Each session keeps its own key, details and progression, and ticks
+        are still saved under that key, so the log is unchanged. A day may
+        have only one session from each group (checked on load). Clicking
+        the row name shows every session in the group. The v21 version is
+        saved as training_tracker.v21.bak.
 """
 
 import getpass
@@ -174,6 +187,8 @@ LOG_VERSION = 3
 CHECK_FIELDS = ("id", "planned_date", "item", "user", "checked_at", "unchecked_at")
 SCHEDULE_FILE = Path.home() / ".claude" / "profile" / "fitness-training.md"
 CYCLE_DAYS = 14
+# The extra tickable row below Notes: (log key, row name). Not counted in Done.
+MIDNIGHT_OIL = ("midnight_oil", "Midnight oil")
 
 
 def find_vscode():
@@ -217,6 +232,7 @@ class Schedule:
     habits: list          # [(key, name, details)]
     sessions: dict        # {session key: (title, details text)}, in file order
     pinned: list          # session keys listed at the bottom of the window
+    combined: list        # [(row name, [session keys])] that share one grid row
 
 
 def split_sections(text):
@@ -315,6 +331,24 @@ def load_schedule(path=SCHEDULE_FILE):
     for key in pinned:
         check_session(key, "Settings, Pinned details")
 
+    # Combined rows: 'Bike: bike, long_bike; Run/walk: run, long_run'
+    # = groups split by ';', each 'Row name: key, key, ...'.
+    combined = []
+    where = "Settings, Combined rows"
+    for part in settings.get("Combined rows", "").split(";"):
+        if not part.strip():
+            continue
+        name, colon, key_text = part.partition(":")
+        keys = [k.strip() for k in key_text.split(",") if k.strip()]
+        if not colon or not name.strip() or len(keys) < 2:
+            raise ScheduleError(f"{where}: write each group as 'Row name: key1, key2' "
+                                f"(groups separated by ';'), not '{part.strip()}'.")
+        for key in keys:
+            check_session(key, where)
+            if any(key in group for _, group in combined) or keys.count(key) > 1:
+                raise ScheduleError(f"{where}: '{key}' is listed more than once.")
+        combined.append((name.strip(), keys))
+
     # The 14-day cycle: one list of rows per day, like GROUP BY Day.
     cycle = [[] for _ in range(CYCLE_DAYS)]
     cols = ["Day", "Weekday", "Where", "Slot", "Session", "Task", "Starts"]
@@ -335,6 +369,13 @@ def load_schedule(path=SCHEDULE_FILE):
             "where": r["Where"], "slot": r["Slot"], "key": r["Session"], "task": r["Task"],
             "starts": to_date(r["Starts"], where) if r["Starts"] else None,
         })
+
+    # A combined row has one cell per day, so a day can't use two of its sessions.
+    for name, keys in combined:
+        for day, rows in enumerate(cycle, start=1):
+            if sum(t["key"] in keys for t in rows) > 1:
+                raise ScheduleError(f"Combined rows, '{name}': Day {day} has more than "
+                                    f"one of {', '.join(keys)}, but they share one row.")
 
     progression = {}
     for r in read_table(sections, "Progression", ["Session", "Per cycle", "Cap", "Round to"]):
@@ -357,7 +398,7 @@ def load_schedule(path=SCHEDULE_FILE):
             habits.append((key, r["Habit"], r["Details"]))
 
     return Schedule(anchor, days_back, days_ahead, light_every, light_scale,
-                    cycle, progression, notes, habits, sessions, pinned)
+                    cycle, progression, notes, habits, sessions, pinned, combined)
 
 
 # --- Turning the schedule into one day's plan --------------------------------
@@ -662,28 +703,40 @@ class TrainingTracker:
             if on_click:
                 self.clickable(label, on_click)
 
-        # Only session types that appear in the dates shown, in file order.
+        # Session rows: only session types that appear in the dates shown, in
+        # file order. Each is (row name, [keys]); a combined group takes the
+        # place of its first member, and a plain session is a group of one.
         used = {key for day in self.days.values() for key in day.tasks}
-        session_keys = [k for k in self.sched.sessions if k in used]
+        group_of = {k: (name, keys) for name, keys in self.sched.combined for k in keys}
+        groups = []
+        for key in self.sched.sessions:
+            if key not in used:
+                continue
+            group = group_of.get(key, (short_title(self.sched.sessions[key][0]), [key]))
+            if group not in groups:
+                groups.append(group)
         habits = self.sched.habits
         habit_rows = range(1, 1 + len(habits))
         sep_row = 1 + len(habits)  # an empty, short row between the two groups
-        session_rows = range(sep_row + 1, sep_row + 1 + len(session_keys))
-        done_row = sep_row + 1 + len(session_keys)
+        session_rows = range(sep_row + 1, sep_row + 1 + len(groups))
+        done_row = sep_row + 1 + len(groups)
         notes_row = done_row + 1
+        sep2_row = notes_row + 1  # another short gap, before Midnight oil
+        oil_row = sep2_row + 1
 
         self.table.rowconfigure(0, minsize=HEAD_H)
-        self.table.rowconfigure(sep_row, minsize=SEP_H)
-        for r in [*habit_rows, *session_rows, done_row, notes_row]:
+        for r in [sep_row, sep2_row]:
+            self.table.rowconfigure(r, minsize=SEP_H)
+        for r in [*habit_rows, *session_rows, done_row, notes_row, oil_row]:
             self.table.rowconfigure(r, minsize=ROW_H)
 
         for r, (key, name, details) in zip(habit_rows, habits):
             row_name(r, name, lambda n=name, t=details: self.show_message(n, t))
-        for r, key in zip(session_rows, session_keys):
-            row_name(r, short_title(self.sched.sessions[key][0]),
-                     lambda k=key: self.show_session(k))
+        for r, (name, keys) in zip(session_rows, groups):
+            row_name(r, name, lambda n=name, ks=keys: self.show_sessions(n, ks))
         row_name(done_row, "Done", bold=False)
         row_name(notes_row, "Notes", bold=False)
+        row_name(oil_row, MIDNIGHT_OIL[1])
 
         self.done_labels = {}  # {date: label in the Done row}
         self.note_icons = {}   # {date: pencil icon in the Notes row}
@@ -697,8 +750,10 @@ class TrainingTracker:
                            lambda d=d: self.show_day(d))
             for r, (key, name, details) in zip(habit_rows, habits):
                 self.checkbox_cell(r, c, d, key)
-            for r, key in zip(session_rows, session_keys):
-                if key in day.tasks:
+            for r, (name, keys) in zip(session_rows, groups):
+                # The group's session planned for this day, if any (at most one).
+                key = next((k for k in keys if k in day.tasks), None)
+                if key:
                     self.checkbox_cell(r, c, d, key, cell_text(*day.tasks[key]))
                 else:
                     self.put(tk.Frame(self.table, bg=bg), r, c)  # nothing planned
@@ -710,6 +765,7 @@ class TrainingTracker:
                 lambda d=d: self.edit_note(d))
             self.hoverable(icon, lambda d=d: ("", self.notes.get(d.isoformat())))
             self.update_note_icon(d)
+            self.checkbox_cell(oil_row, c, d, MIDNIGHT_OIL[0])
 
     def checkbox_cell(self, row, col, d, key, text=""):
         """One tickable cell. Habit cells: just a centered checkbox. Session
@@ -828,6 +884,14 @@ class TrainingTracker:
     def show_session(self, key, d=None):
         self.show_message(*self.session_details(key, d))
 
+    def show_sessions(self, name, keys):
+        """Row-name click: one session's details, or every session in a combined row."""
+        if len(keys) == 1:
+            self.show_session(keys[0])
+        else:
+            self.show_message(name, "\n\n\n".join(
+                f"{title}\n\n{text}" for title, text in (self.sched.sessions[k] for k in keys)))
+
     def show_day(self, d):
         day = self.days[d]
         lines = [f"Where: {day.location}"] if day.location else []
@@ -835,6 +899,7 @@ class TrainingTracker:
         mark = lambda key: "[x]" if task_id(d, key) in self.ticked else "[ ]"
         lines += [f"{mark(key)} {slot}  {label}" for key, (slot, label) in day.tasks.items()]
         lines += [f"{mark(key)}     {name}" for key, name, _ in self.sched.habits]
+        lines.append(f"{mark(MIDNIGHT_OIL[0])}     {MIDNIGHT_OIL[1]}")
         if d.isoformat() in self.notes:
             lines += ["", "My notes:", self.notes[d.isoformat()]]
         self.show_message(f"{d:%A, %B %d}  ·  day {day.cycle_day + 1} of {CYCLE_DAYS}",
