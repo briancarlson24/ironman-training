@@ -2,8 +2,8 @@
 Training tracker
 ================
 PURPOSE
-    A desktop window for tracking training toward the 2027 marathon and
-    Ironman 70.3 Michigan. It shows a grid with one column per day (the
+    A desktop window for tracking training toward the early-summer 2027
+    marathon and a full Ironman (140.6) in fall 2027. It shows a grid with one column per day (the
     prior 6 days, today, and the next 7) and one row per item:
       - daily habits at the top (Meds, Water, Sleep 8hrs, Nutrition)
       - then one row per session type (Mobility, Strength A, Run/walk, ...)
