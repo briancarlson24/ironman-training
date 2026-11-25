@@ -1,3 +1,4 @@
+#! python3.11
 """
 Training tracker
 ================
@@ -22,8 +23,12 @@ PURPOSE
 
 RUN
     Double-click the file (.pyw files run with no console window), or:
-    C:\\Users\\brian\\AppData\\Local\\Programs\\Python\\Python310\\pythonw.exe
+    C:\\Users\\brian\\AppData\\Local\\Programs\\Python\\Python311\\pythonw.exe
         "C:\\Users\\brian\\.claude\\Ironman Training\\training_tracker.pyw"
+    The '#! python3.11' first line tells the Windows launcher (pyw.exe) to
+    use Python 3.11. To see errors, run it in a terminal instead:
+        py -3.11 training_tracker.pyw
+    Needs CustomTkinter: py -3.11 -m pip install customtkinter
 
 FILES
     training_tracker.pyw   this script
@@ -165,8 +170,32 @@ CHANGE LOG (all 2026-11-21)
         have only one session from each group (checked on load). Clicking
         the row name shows every session in the group. The v21 version is
         saved as training_tracker.v21.bak.
+    v23 Restyled in the look of a dark-mode Apple app (2026-11-25). Same
+        behavior and log file; only the drawing code changed. Needs the
+        CustomTkinter package (py -3.11 -m pip install customtkinter, and
+        the same for 3.10). The v22 version is saved as training_tracker.v22.bak.
+        - Apple's dark palette (system green/blue/yellow) and larger,
+          regular-weight type; a big 'Training' title over a grey summary.
+        - The grid and the exercise lists sit on rounded cards, with no
+          grid lines.
+        - Date headers like Apple's Calendar: grey weekday over the day
+          number; today in a blue circle; the 1st of a month reads 'Dec 1'.
+        - Round check icons (a grey ring, or a green circle with a tick)
+          from the Segoe MDL2 Assets font, instead of Windows checkboxes.
+          Clicking anywhere in a habit cell toggles it. (CustomTkinter's own
+          checkboxes took ~1 s to draw a full grid; font icons are instant.)
+        - Exercise lists: bold name with a grey subtitle, small grey section
+          headings, and bullets with a hanging indent.
+        - Day popup lists each session and habit with the same check icons.
+        - Rounded buttons (Save is blue), a rounded notes box, and dark
+          title bars on popups.
+        - New first line '#! python3.11'. A double-click goes through the
+          Windows launcher, which otherwise picks whichever Python is the
+          default; this pins it to 3.11, so the app always runs where
+          CustomTkinter is installed. RUN above now names 3.11.
 """
 
+import ctypes
 import getpass
 import json
 import os
@@ -175,6 +204,8 @@ import shutil
 import subprocess
 import tkinter as tk
 import uuid
+
+import customtkinter as ctk  # rounded, modern widgets (pip install customtkinter)
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -203,14 +234,39 @@ def find_vscode():
 
 VSCODE = find_vscode()
 
-# Colors: same dark palette as the stargazing widget.
-BG, CARD, FG, DIM = "#10172a", "#1e293b", "#e2e8f0", "#94a3b8"
-GOOD, ACCENT, WARN = "#4ade80", "#60a5fa", "#facc15"
-TODAY_BG, DONE_BG, HOVER = "#1e3a5f", "#14532d", "#334155"
-FONT = "Segoe UI"
+
+def dark_title_bar(win):
+    """Ask Windows to draw a window's title bar dark, to match the app.
+    (CustomTkinter does this for the main window; popups are plain tkinter
+    windows, so they need it done by hand.) Does nothing if Windows refuses."""
+    try:
+        win.update_idletasks()  # make sure the window exists before asking
+        hwnd = ctypes.windll.user32.GetParent(win.winfo_id())  # the outer window
+        on = ctypes.c_int(1)
+        # 20 = DWMWA_USE_IMMERSIVE_DARK_MODE; older Windows 10 builds used 19.
+        for attribute in (20, 19):
+            if ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                    hwnd, attribute, ctypes.byref(on), ctypes.sizeof(on)) == 0:
+                break
+    except (AttributeError, OSError):  # not Windows, or no dwmapi
+        pass
+
+# Colors: Apple's dark-mode system palette (window, grouped card, label,
+# secondary label; system green / blue / yellow).
+BG, CARD, FG, DIM = "#1C1C1E", "#2C2C2E", "#F5F5F7", "#8E8E93"
+GOOD, ACCENT, WARN = "#30D158", "#0A84FF", "#FFD60A"
+TODAY_BG, DONE_BG, HOVER = "#1F3047", "#1F3D2A", "#3A3A3C"
+RAISED, ACCENT_HOVER = "#48484A", "#409CFF"  # hover shades for buttons on a card
+FONT = "Segoe UI"  # closest Windows match to Apple's SF Pro
+
+# Icons from Segoe MDL2 Assets, the icon font built into Windows 10. Font
+# glyphs are smooth (anti-aliased) and much faster to draw than
+# CustomTkinter's checkboxes, which matters with ~200 cells in the grid.
+ICON_FONT = "Segoe MDL2 Assets"
+UNCHECKED, CHECKED, PENCIL = "", "", ""  # ring, green check, pencil
 
 # Grid sizes in pixels.
-COL_W, LABEL_W, ROW_H, HEAD_H, SEP_H = 54, 120, 28, 40, 10
+COL_W, LABEL_W, ROW_H, HEAD_H, SEP_H = 56, 130, 30, 50, 14
 DETAIL_WRAP = 280  # text width of each column in the bottom section
 
 
@@ -479,6 +535,21 @@ def exercises_only(text):
     return "\n".join(keep)
 
 
+def pinned_lines(text):
+    """Turn exercises_only() text into [(is_heading, text)] for display:
+    list markers ('- ') removed, and an item's wrapped continuation lines
+    joined back onto it. Numbered items ('1. Wall calf stretch') keep their number."""
+    lines = []
+    for line in text.splitlines():
+        if re.match(r"\s*(-|\d+\.)\s", line):                  # a list item
+            lines.append((False, re.sub(r"^\s*-\s+", "", line).strip()))
+        elif line.startswith("    ") and lines and not lines[-1][0]:
+            lines[-1] = (False, f"{lines[-1][1]} {line.strip()}")  # its wrapped line
+        elif line.strip():                                      # an ALL-CAPS heading
+            lines.append((True, line.strip()))
+    return lines
+
+
 def task_id(d, key):
     """Stable ID for the log file, e.g. '2026-11-23|mobility'."""
     return f"{d.isoformat()}|{key}"
@@ -589,34 +660,42 @@ class TrainingTracker:
         self.tip = None    # the hover tooltip for a note, while one is showing
 
         root.title("Training tracker")
-        root.configure(bg=BG, padx=14, pady=12)
+        # Everything sits in one padded frame (the window's margins).
+        body = tk.Frame(root, bg=BG, padx=20, pady=16)
+        body.pack(fill="both", expand=True)
 
-        # Header: title, plus buttons on the right.
-        top = tk.Frame(root, bg=BG)
+        # Header: a large title with a quiet summary line under it, and
+        # rounded buttons on the right.
+        top = tk.Frame(body, bg=BG)
         top.pack(fill="x")
-        tk.Label(top, text="Training tracker", font=(FONT, 13, "bold"),
+        tk.Label(top, text="Training", font=(FONT, 20, "bold"),
                  bg=BG, fg=FG).pack(side="left")
         for text, command in [("Reload", self.reload),
                               ("Open schedule", lambda: self.open_file(SCHEDULE_FILE))]:
-            self.button(top, text, command, CARD).pack(side="right", padx=(6, 0))
-        self.summary = tk.Label(root, font=(FONT, 10), bg=BG, fg=FG, anchor="w")
-        self.summary.pack(fill="x", pady=(2, 8))
+            self.button(top, text, command, CARD).pack(side="right", padx=(8, 0))
+        self.summary = tk.Label(body, font=(FONT, 10), bg=BG, fg=DIM, anchor="w")
+        self.summary.pack(fill="x", pady=(0, 12))
 
-        # The grid: column 0 = row names, columns 1.. = days.
-        self.table = tk.Frame(root, bg=BG)
-        self.table.pack(anchor="w")
+        # The grid, on a rounded card: column 0 = row names, columns 1.. = days.
+        grid_card = ctk.CTkFrame(body, fg_color=CARD, corner_radius=12)
+        grid_card.pack(anchor="w")
+        self.table = tk.Frame(grid_card, bg=CARD)
+        self.table.pack(padx=12, pady=10)
 
-        # Below: the pinned sessions' exercise lists (Mobility, Strength A, ...).
-        self.pinned_frame = tk.Frame(root, bg=CARD, padx=12, pady=10)
-        self.pinned_frame.pack(fill="both", expand=True, pady=(10, 0))
+        # Below, on a second rounded card: the pinned sessions' exercise
+        # lists (Mobility, Strength A, ...).
+        pinned_card = ctk.CTkFrame(body, fg_color=CARD, corner_radius=12)
+        pinned_card.pack(fill="both", expand=True, pady=(14, 0))
+        self.pinned_frame = tk.Frame(pinned_card, bg=CARD)
+        self.pinned_frame.pack(fill="both", expand=True, padx=16, pady=14)
 
         # Footer: clickable links to the two files, then any warning message.
-        footer = tk.Frame(root, bg=BG)
-        footer.pack(fill="x", pady=(8, 0))
-        for caption, path in [("Schedule:", SCHEDULE_FILE), ("Log:", LOG_FILE)]:
+        footer = tk.Frame(body, bg=BG)
+        footer.pack(fill="x", pady=(10, 0))
+        for caption, path in [("Schedule", SCHEDULE_FILE), ("Log", LOG_FILE)]:
             tk.Label(footer, text=caption, font=(FONT, 8), bg=BG,
-                     fg=DIM).pack(side="left", padx=(0, 3))
-            link = tk.Label(footer, text=str(path), font=(FONT, 8, "underline"),
+                     fg=DIM).pack(side="left", padx=(0, 4))
+            link = tk.Label(footer, text=str(path), font=(FONT, 8),
                             bg=BG, fg=ACCENT, cursor="hand2")
             link.bind("<Button-1>", lambda e, p=path: self.open_file(p))
             link.pack(side="left", padx=(0, 16))
@@ -629,18 +708,23 @@ class TrainingTracker:
         self.watch_date()
 
     # --- Small widget helpers ----------------------------------------------------
-    def button(self, parent, text, command, bg):
-        return tk.Button(parent, text=text, command=command, font=(FONT, 8),
-                         relief="flat", bg=bg, fg=FG, activebackground=HOVER,
-                         activeforeground=FG)
+    def button(self, parent, text, command, bg=CARD, hover=HOVER, primary=False):
+        """A rounded CustomTkinter button that lightens on hover. A primary
+        button (e.g. Save) is filled blue, like Apple's default button."""
+        if primary:
+            bg, hover = ACCENT, ACCENT_HOVER
+        return ctk.CTkButton(parent, text=text, command=command, width=0, height=28,
+                             corner_radius=8, fg_color=bg, hover_color=hover,
+                             text_color=FG, font=ctk.CTkFont(FONT, 12))
 
     def put(self, widget, row, col):
-        """Place a widget in the grid. The 1-pixel gap shows as grid lines."""
-        widget.grid(row=row, column=col, sticky="nsew", padx=(0, 1), pady=(0, 1))
+        """Place a widget in the grid. No gaps: cells are separated by
+        spacing and color, not grid lines."""
+        widget.grid(row=row, column=col, sticky="nsew")
         return widget
 
     def clickable(self, widget, on_click):
-        widget.config(cursor="hand2")
+        widget.configure(cursor="hand2")  # configure, not config: CTk widgets need it
         widget.bind("<Button-1>", lambda e: on_click())
         return widget
 
@@ -648,7 +732,7 @@ class TrainingTracker:
         """A bold title plus a block of wrapped text."""
         labels = [tk.Label(parent, font=(FONT, size, weight), bg=CARD, fg=FG,
                            anchor="nw", justify="left", wraplength=wrap)
-                  for size, weight in [(10, "bold"), (9, "normal")]]
+                  for size, weight in [(11, "bold"), (10, "normal")]]
         labels[0].pack(fill="x")
         labels[1].pack(fill="both", expand=True, pady=(4, 0))
         return labels
@@ -696,9 +780,10 @@ class TrainingTracker:
             self.table.columnconfigure(c, minsize=COL_W)
 
         def row_name(row, text, on_click=None, bold=True):
-            label = tk.Label(self.table, text=text, bg=BG, anchor="w",
-                             fg=FG if bold else DIM,
-                             font=(FONT, 9, "bold" if bold else "normal"))
+            """Regular weight, not bold: Apple uses size and color for
+            hierarchy. 'bold=False' rows (Done, Notes) are grey instead."""
+            label = tk.Label(self.table, text=text, bg=CARD, anchor="w",
+                             fg=FG if bold else DIM, font=(FONT, 10))
             label.grid(row=row, column=0, sticky="nsew")
             if on_click:
                 self.clickable(label, on_click)
@@ -737,17 +822,16 @@ class TrainingTracker:
         row_name(done_row, "Done", bold=False)
         row_name(notes_row, "Notes", bold=False)
         row_name(oil_row, MIDNIGHT_OIL[1])
+        # Top-left corner: the current month, since the headers show only day numbers.
+        tk.Label(self.table, text=self.today.strftime("%B"), bg=CARD, fg=FG,
+                 font=(FONT, 12, "bold"), anchor="sw").grid(row=0, column=0, sticky="nsew",
+                                                            pady=(0, 6))
 
         self.done_labels = {}  # {date: label in the Done row}
         self.note_icons = {}   # {date: pencil icon in the Notes row}
         for c, (d, day) in enumerate(self.days.items(), start=1):
             bg = self.column_bg(d)
-            # Header: weekday and date; '•' if the day has notes.
-            text = d.strftime("%a\n%b %d").replace(" 0", " ") + (" •" if day.notes else "")
-            fg = ACCENT if d == self.today else (DIM if d < self.today else FG)
-            self.clickable(self.put(tk.Label(self.table, text=text, bg=bg, fg=fg,
-                                             font=(FONT, 8, "bold")), 0, c),
-                           lambda d=d: self.show_day(d))
+            self.day_header(d, day, c, bg)
             for r, (key, name, details) in zip(habit_rows, habits):
                 self.checkbox_cell(r, c, d, key)
             for r, (name, keys) in zip(session_rows, groups):
@@ -761,25 +845,48 @@ class TrainingTracker:
                 tk.Label(self.table, bg=bg, font=(FONT, 9, "bold")), done_row, c)
             self.update_count(d)
             icon = self.note_icons[d] = self.clickable(self.put(
-                tk.Label(self.table, text="✎", bg=bg, font=(FONT, 12)), notes_row, c),
+                tk.Label(self.table, text=PENCIL, bg=bg, font=(ICON_FONT, 11)), notes_row, c),
                 lambda d=d: self.edit_note(d))
             self.hoverable(icon, lambda d=d: ("", self.notes.get(d.isoformat())))
             self.update_note_icon(d)
             self.checkbox_cell(oil_row, c, d, MIDNIGHT_OIL[0])
 
+    def day_header(self, d, day, col, bg):
+        """A column header in the style of Apple's Calendar: a small grey
+        weekday ('MON', plus '•' if the day has notes) above the day number.
+        Today's number sits in a filled blue circle. Click it for the day's details."""
+        head = self.put(tk.Frame(self.table, bg=bg), 0, col)
+        weekday = tk.Label(head, text=d.strftime("%a").upper() + (" •" if day.notes else ""),
+                           bg=bg, fg=ACCENT if d == self.today else DIM,
+                           font=(FONT, 8, "bold"))
+        weekday.pack(pady=(4, 0))
+        if d == self.today:
+            number = ctk.CTkLabel(head, text=str(d.day), width=28, height=28,
+                                  corner_radius=14, fg_color=ACCENT, bg_color=bg,
+                                  text_color="#FFFFFF", font=ctk.CTkFont(FONT, 13, "bold"))
+        else:
+            # The 1st of a month shows the month too ('Dec 1'), since the
+            # corner label only names the current month.
+            text = f"{d:%b} 1" if d.day == 1 else str(d.day)
+            number = tk.Label(head, text=text, bg=bg,
+                              fg=DIM if d < self.today else FG, font=(FONT, 13))
+        number.pack(pady=(0, 4))
+        for widget in (head, weekday, number):  # the whole header is one click target
+            self.clickable(widget, lambda: self.show_day(d))
+
     def checkbox_cell(self, row, col, d, key, text=""):
-        """One tickable cell. Habit cells: just a centered checkbox. Session
-        cells: a checkbox plus short text ('30m') that shows the session's
-        details on hover and opens them in a popup on click."""
+        """One tickable cell: a round check icon (a grey ring, or a filled
+        green circle with a tick). Habit cells: the icon, centered; clicking
+        anywhere in the cell toggles it. Session cells: the icon plus short
+        text ('30m') that shows the session's details on hover and opens
+        them in a popup on click."""
         tid = task_id(d, key)
-        var = tk.BooleanVar(value=tid in self.ticked)
         cell = self.put(tk.Frame(self.table), row, col)
-        box = tk.Checkbutton(cell, variable=var, selectcolor=BG,
-                             highlightthickness=0, bd=0, fg=GOOD)
+        box = tk.Label(cell, font=(ICON_FONT, 13), cursor="hand2")
         widgets = [cell, box]
         if text:
-            box.pack(side="left", padx=(1, 0))
-            label = self.clickable(tk.Label(cell, text=text, font=(FONT, 8)),
+            box.pack(side="left", padx=(6, 3))
+            label = self.clickable(tk.Label(cell, text=text, font=(FONT, 9)),
                                    lambda: self.show_message(*self.session_details(key, d)))
             self.hoverable(label, lambda: self.session_details(key, d))
             label.pack(side="left")
@@ -787,33 +894,58 @@ class TrainingTracker:
         else:
             box.pack(expand=True)
 
-        def paint():
-            """Ticked cells turn green; otherwise the column's normal color."""
-            bg = DONE_BG if var.get() else self.column_bg(d)
+        def paint(hover=False):
+            """Ticked: green cell and icon. Not ticked: the column's normal
+            color, with a grey ring that brightens while the mouse is over it."""
+            done = tid in self.ticked
+            bg = DONE_BG if done else self.column_bg(d)
             for w in widgets:
                 w.config(bg=bg)
-            box.config(activebackground=bg)
+            box.config(text=CHECKED if done else UNCHECKED,
+                       fg=GOOD if done else (FG if hover else DIM))
             if text:
-                widgets[2].config(fg=GOOD if var.get() else FG)
+                widgets[2].config(fg=GOOD if done else FG)
 
-        def on_toggle():
-            self.toggle(d, tid, var.get())
-            paint()
+        def on_click(event):
+            self.toggle(d, tid, tid not in self.ticked)
+            paint(hover=True)
 
-        box.config(command=on_toggle)
+        targets = [box] if text else [cell, box]  # session text opens details instead
+        for w in targets:
+            w.bind("<Button-1>", on_click)
+            w.bind("<Enter>", lambda e: paint(hover=True))
+            w.bind("<Leave>", lambda e: paint())
         paint()
 
     def draw_pinned(self):
         """Always-visible exercise lists for the 'Pinned details' sessions."""
         for widget in self.pinned_frame.winfo_children():
             widget.destroy()
-        for key in self.sched.pinned:
+        for i, key in enumerate(self.sched.pinned):
             column = tk.Frame(self.pinned_frame, bg=CARD)
-            column.pack(side="left", fill="y", padx=(0, 20))
-            title, text = self.detail_column(column)
+            column.pack(side="left", fill="y", anchor="n", padx=(0 if i == 0 else 28, 0))
             session_title, body = self.sched.sessions[key]
-            title.config(text=session_title)
-            text.config(text=exercises_only(body))
+            # 'Strength A: lower body, ankles, core (25-35 min)' -> a bold name
+            # with a grey subtitle underneath.
+            name, _, subtitle = session_title.partition(":")
+            tk.Label(column, text=name, font=(FONT, 12, "bold"), bg=CARD, fg=FG,
+                     anchor="w").pack(fill="x")
+            if subtitle.strip():
+                tk.Label(column, text=subtitle.strip(), font=(FONT, 9), bg=CARD, fg=DIM,
+                         anchor="w", justify="left", wraplength=DETAIL_WRAP).pack(fill="x")
+            for is_heading, text in pinned_lines(exercises_only(body)):
+                if is_heading:  # 'ANKLES': small grey caps, like an Apple list header
+                    tk.Label(column, text=text, font=(FONT, 8, "bold"), bg=CARD, fg=DIM,
+                             anchor="w").pack(fill="x", pady=(8, 1))
+                    continue
+                # A bullet and its text side by side, so wrapped lines stay
+                # indented under the text (a hanging indent).
+                item = tk.Frame(column, bg=CARD)
+                item.pack(fill="x", pady=1)
+                tk.Label(item, text="•", font=(FONT, 9), bg=CARD, fg=DIM).pack(
+                    side="left", anchor="n", padx=(0, 6))
+                tk.Label(item, text=text, font=(FONT, 9), bg=CARD, fg=FG, anchor="w",
+                         justify="left", wraplength=DETAIL_WRAP - 14).pack(side="left")
 
     # --- Ticks and counts --------------------------------------------------------
     def toggle(self, d, tid, is_done):
@@ -893,17 +1025,51 @@ class TrainingTracker:
                 f"{title}\n\n{text}" for title, text in (self.sched.sessions[k] for k in keys)))
 
     def show_day(self, d):
+        """Date-header click: a popup with the day's plan. Where and the
+        plan's notes under the title, then each training session and habit
+        with the same check icons as the grid, then the day's own notes."""
         day = self.days[d]
-        lines = [f"Where: {day.location}"] if day.location else []
-        lines += [f"Note: {n}" for n in day.notes] + [""]
-        mark = lambda key: "[x]" if task_id(d, key) in self.ticked else "[ ]"
-        lines += [f"{mark(key)} {slot}  {label}" for key, (slot, label) in day.tasks.items()]
-        lines += [f"{mark(key)}     {name}" for key, name, _ in self.sched.habits]
-        lines.append(f"{mark(MIDNIGHT_OIL[0])}     {MIDNIGHT_OIL[1]}")
+        win = self.new_popup("Details")
+
+        def text(parent, value, size=10, fg=FG, weight="normal", **pack):
+            label = tk.Label(parent, text=value, font=(FONT, size, weight), bg=CARD, fg=fg,
+                             anchor="w", justify="left", wraplength=420)
+            label.pack(fill="x", **pack)
+            return label
+
+        def heading(value):  # small grey caps, like the exercise lists
+            text(win, value, size=8, fg=DIM, weight="bold", pady=(12, 2))
+
+        def check_row(key, slot, label):
+            """A check icon, the time of day in grey (if any), then the item."""
+            done = task_id(d, key) in self.ticked
+            row = tk.Frame(win, bg=CARD)
+            row.pack(fill="x", pady=1)
+            tk.Label(row, text=CHECKED if done else UNCHECKED, font=(ICON_FONT, 12),
+                     bg=CARD, fg=GOOD if done else DIM).pack(side="left", padx=(0, 8))
+            if slot:
+                tk.Label(row, text=slot, font=(FONT, 9), bg=CARD, fg=DIM).pack(
+                    side="left", padx=(0, 6))
+            tk.Label(row, text=label, font=(FONT, 10), bg=CARD, fg=FG, anchor="w",
+                     justify="left", wraplength=360).pack(side="left")
+
+        text(win, f"{d:%A, %B} {d.day}", size=12, weight="bold")
+        text(win, "  ·  ".join([f"Day {day.cycle_day + 1} of {CYCLE_DAYS}"]
+                               + ([day.location] if day.location else [])), size=9, fg=DIM)
+        for note in day.notes:
+            text(win, note, size=9, pady=(6, 0))
+        if day.tasks:
+            heading("TRAINING")
+            for key, (slot, label) in day.tasks.items():
+                check_row(key, slot, label)
+        heading("HABITS")
+        for key, name, _ in [*self.sched.habits, (*MIDNIGHT_OIL, "")]:
+            check_row(key, "", name)
         if d.isoformat() in self.notes:
-            lines += ["", "My notes:", self.notes[d.isoformat()]]
-        self.show_message(f"{d:%A, %B %d}  ·  day {day.cycle_day + 1} of {CYCLE_DAYS}",
-                          "\n".join(lines))
+            heading("MY NOTES")
+            text(win, self.notes[d.isoformat()])
+        self.button(win, "Close", win.destroy, HOVER, RAISED).pack(anchor="e", pady=(14, 0))
+        self.place_popup(win)
 
     def new_popup(self, title):
         """A small window that replaces any open one. Escape closes it.
@@ -911,11 +1077,12 @@ class TrainingTracker:
         self.hide_tip()  # a click opens a popup; don't leave the tooltip too
         if self.popup is not None and self.popup.winfo_exists():
             self.popup.destroy()
-        win = self.popup = tk.Toplevel(self.root, bg=CARD, padx=14, pady=10)
+        win = self.popup = tk.Toplevel(self.root, bg=CARD, padx=18, pady=14)
         win.title(title)
         win.transient(self.root)  # stays on top of the tracker, no taskbar entry
         win.resizable(False, False)
         win.bind("<Escape>", lambda e: win.destroy())
+        dark_title_bar(win)
         return win
 
     def place_popup(self, win):
@@ -931,7 +1098,7 @@ class TrainingTracker:
         title_label, text_label = self.detail_column(win, wrap=420)
         title_label.config(text=title)
         text_label.config(text=text)
-        self.button(win, "Close", win.destroy, BG).pack(anchor="e", pady=(8, 0))
+        self.button(win, "Close", win.destroy, HOVER, RAISED).pack(anchor="e", pady=(12, 0))
         self.place_popup(win)
 
     # --- Daily notes ---------------------------------------------------------------
@@ -940,11 +1107,13 @@ class TrainingTracker:
         stores it; saving an empty box deletes the note."""
         key = d.isoformat()
         win = self.new_popup("Notes")
-        tk.Label(win, text=f"Notes for {d:%A, %B %d}", font=(FONT, 10, "bold"),
+        tk.Label(win, text=f"Notes for {d:%A, %B %d}", font=(FONT, 11, "bold"),
                  bg=CARD, fg=FG, anchor="w").pack(fill="x")
-        box = tk.Text(win, width=50, height=8, wrap="word", font=(FONT, 10),
-                      bg=BG, fg=FG, insertbackground=FG, relief="flat", padx=6, pady=4)
-        box.pack(pady=(6, 0))
+        # A rounded text box (CustomTkinter) with a subtle border.
+        box = ctk.CTkTextbox(win, width=440, height=170, wrap="word", corner_radius=8,
+                             border_width=1, border_color=HOVER, fg_color=BG,
+                             text_color=FG, font=ctk.CTkFont(FONT, 14))
+        box.pack(pady=(8, 0))
         box.insert("1.0", self.notes.get(key, ""))
 
         def save():
@@ -958,9 +1127,9 @@ class TrainingTracker:
             win.destroy()
 
         buttons = tk.Frame(win, bg=CARD)
-        buttons.pack(fill="x", pady=(8, 0))
-        self.button(buttons, "Save", save, BG).pack(side="right", padx=(6, 0))
-        self.button(buttons, "Cancel", win.destroy, BG).pack(side="right")
+        buttons.pack(fill="x", pady=(12, 0))
+        self.button(buttons, "Save", save, primary=True).pack(side="right", padx=(8, 0))
+        self.button(buttons, "Cancel", win.destroy, HOVER, RAISED).pack(side="right")
         tk.Label(buttons, text="Ctrl+Enter to save", font=(FONT, 8), bg=CARD,
                  fg=DIM).pack(side="left")
         box.bind("<Control-Return>", lambda e: (save(), "break")[1])
@@ -982,8 +1151,8 @@ class TrainingTracker:
         self.hide_tip()
         if not text:
             return
-        tip = self.tip = tk.Toplevel(self.root, bg=CARD, padx=10, pady=8,
-                                     highlightthickness=1, highlightbackground=DIM)
+        tip = self.tip = tk.Toplevel(self.root, bg=CARD, padx=12, pady=10,
+                                     highlightthickness=1, highlightbackground=HOVER)
         tip.overrideredirect(True)  # no title bar or border
         tip.attributes("-topmost", True)
         title_label, text_label = self.detail_column(tip, wrap=380)
@@ -1033,7 +1202,8 @@ class TrainingTracker:
 
 # --- Start the app -----------------------------------------------------------
 if __name__ == "__main__":
-    root = tk.Tk()
+    ctk.set_appearance_mode("dark")  # also gives the window a dark title bar
+    root = ctk.CTk(fg_color=BG)
     TrainingTracker(root)
     root.geometry("+40+30")  # size to fit the content, near the top-left
     root.minsize(600, 400)
